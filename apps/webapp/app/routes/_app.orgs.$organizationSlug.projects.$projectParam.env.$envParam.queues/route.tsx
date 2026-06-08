@@ -5,7 +5,9 @@ import {
   ChatBubbleLeftEllipsisIcon,
   PauseIcon,
   PlayIcon,
+  PlusIcon,
   RectangleStackIcon,
+  XMarkIcon,
 } from "@heroicons/react/20/solid";
 import { DialogClose } from "@radix-ui/react-dialog";
 import { Form, useNavigation, useSearchParams, type MetaFunction } from "@remix-run/react";
@@ -28,9 +30,12 @@ import { Badge } from "~/components/primitives/Badge";
 import { Button, LinkButton, type ButtonVariant } from "~/components/primitives/Buttons";
 import { Callout } from "~/components/primitives/Callout";
 import { Dialog, DialogContent, DialogHeader, DialogTrigger } from "~/components/primitives/Dialog";
+import { Fieldset } from "~/components/primitives/Fieldset";
 import { FormButtons } from "~/components/primitives/FormButtons";
 import { Header3 } from "~/components/primitives/Headers";
 import { Input } from "~/components/primitives/Input";
+import { InputGroup } from "~/components/primitives/InputGroup";
+import { Label } from "~/components/primitives/Label";
 import { SearchInput } from "~/components/primitives/SearchInput";
 import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
 import { PaginationControls } from "~/components/primitives/Pagination";
@@ -63,6 +68,7 @@ import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/m
 import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { getUserById } from "~/models/user.server";
+import { prisma } from "~/db.server";
 import { EnvironmentQueuePresenter } from "~/presenters/v3/EnvironmentQueuePresenter.server";
 import { QueueListPresenter } from "~/presenters/v3/QueueListPresenter.server";
 import { requireUserId } from "~/services/session.server";
@@ -75,6 +81,7 @@ import {
   v3RunsPath,
 } from "~/utils/pathBuilder";
 import { concurrencySystem } from "~/v3/services/concurrencySystemInstance.server";
+import { rateLimitSystem } from "~/v3/services/rateLimitSystemInstance.server";
 import { PauseEnvironmentService } from "~/v3/services/pauseEnvironment.server";
 import { PauseQueueService } from "~/v3/services/pauseQueue.server";
 import { useCurrentPlan } from "../_app.orgs.$organizationSlug/route";
@@ -221,6 +228,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     case "queue-override": {
       const friendlyId = formData.get("friendlyId");
       const concurrencyLimit = formData.get("concurrencyLimit");
+      const rateLimitsJson = formData.get("rateLimits");
 
       if (!friendlyId) {
         return redirectWithErrorMessage(redirectPath, request, "Queue ID is required");
@@ -259,10 +267,31 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         );
       }
 
+      if (rateLimitsJson) {
+        try {
+          const rateLimits = JSON.parse(rateLimitsJson.toString()) as Array<{ limit: number; window: number }>;
+          const queue = await prisma.taskQueue.findFirst({
+            where: { friendlyId: friendlyId.toString(), runtimeEnvironmentId: environment.id },
+          });
+          if (queue) {
+            await rateLimitSystem.overrideQueueRateLimit(environment, queue.name, rateLimits);
+          }
+        } catch (e) {
+          return redirectWithErrorMessage(redirectPath, request, "Invalid rate limits format");
+        }
+      } else {
+        const queue = await prisma.taskQueue.findFirst({
+          where: { friendlyId: friendlyId.toString(), runtimeEnvironmentId: environment.id },
+        });
+        if (queue) {
+          await rateLimitSystem.resetQueueRateLimit(environment, queue.name);
+        }
+      }
+
       return redirectWithSuccessMessage(
         redirectPath,
         request,
-        "Queue concurrency limit overridden"
+        "Queue limits overridden"
       );
     }
     case "queue-remove-override": {
@@ -285,7 +314,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         );
       }
 
-      return redirectWithSuccessMessage(redirectPath, request, "Queue concurrency limit reset");
+      const queue = await prisma.taskQueue.findFirst({
+        where: { friendlyId: friendlyId.toString(), runtimeEnvironmentId: environment.id },
+      });
+      if (queue) {
+        await rateLimitSystem.resetQueueRateLimit(environment, queue.name);
+      }
+
+      return redirectWithSuccessMessage(redirectPath, request, "Queue limits reset");
     }
     default:
       return redirectWithErrorMessage(redirectPath, request, "Something went wrong");
@@ -451,6 +487,7 @@ export default function Page() {
                     <TableHeaderCell alignment="right">Queued</TableHeaderCell>
                     <TableHeaderCell alignment="right">Running</TableHeaderCell>
                     <TableHeaderCell alignment="right">Limit</TableHeaderCell>
+                    <TableHeaderCell alignment="right">Rate Limit</TableHeaderCell>
                     <TableHeaderCell
                       alignment="right"
                       tooltip={
@@ -576,6 +613,25 @@ export default function Page() {
                           <TableCell
                             alignment="right"
                             className={cn(
+                              "w-[1%] pl-16 tabular-nums",
+                              queue.paused ? "opacity-50" : undefined
+                            )}
+                          >
+                            {queue.rateLimit && queue.rateLimit.length > 0 ? (
+                              <div className="flex flex-col items-end">
+                                {queue.rateLimit.map((rl: any, i: number) => (
+                                  <span key={i} className="text-xs text-text-dimmed">
+                                    {rl.limit} / {rl.window}s
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-text-dimmed">-</span>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            alignment="right"
+                            className={cn(
                               "w-[1%] pl-16",
                               queue.paused ? "opacity-50" : undefined,
                               isAtConcurrencyLimit && "text-warning",
@@ -648,7 +704,7 @@ export default function Page() {
                                     rootOnly: false,
                                   })}
                                 />
-                                <QueueOverrideConcurrencyButton
+                                <QueueOverrideLimitsButton
                                   queue={queue}
                                   environmentConcurrencyLimit={environment.concurrencyLimit}
                                 />
@@ -880,7 +936,7 @@ function QueuePauseResumeButton({
   );
 }
 
-function QueueOverrideConcurrencyButton({
+function QueueOverrideLimitsButton({
   queue,
   environmentConcurrencyLimit,
 }: {
@@ -892,8 +948,11 @@ function QueueOverrideConcurrencyButton({
   const [concurrencyLimit, setConcurrencyLimit] = useState<string>(
     queue.concurrencyLimit?.toString() ?? environmentConcurrencyLimit.toString()
   );
+  const [rateLimits, setRateLimits] = useState<Array<{ limit: number; window: number }>>(
+    queue.rateLimit && queue.rateLimit.length > 0 ? queue.rateLimit : [{ limit: 0, window: 0 }]
+  );
 
-  const isOverridden = !!queue.concurrency?.overriddenAt;
+  const isOverridden = !!queue.concurrency?.overriddenAt || (queue.rateLimit && queue.rateLimit.length > 0);
   const currentLimit = queue.concurrencyLimit ?? environmentConcurrencyLimit;
 
   useEffect(() => {
@@ -915,34 +974,35 @@ function QueueOverrideConcurrencyButton({
           title={isOverridden ? "Edit override…" : "Override limit…"}
         />
       </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          {isOverridden ? "Edit concurrency override" : "Override concurrency limit"}
+      <DialogContent className="p-0 pt-2.5 md:max-w-lg">
+        <DialogHeader className="px-4">
+          {isOverridden ? "Edit limits override" : "Override limits"}
         </DialogHeader>
-        <div className="flex flex-col gap-3 pt-3">
-          {isOverridden ? (
-            <Paragraph>
-              This queue's concurrency limit is currently overridden to {currentLimit}.
-              {typeof queue.concurrency?.base === "number" &&
-                ` The original limit set in code was ${queue.concurrency.base}.`}{" "}
-              You can update the override or remove it to restore the{" "}
-              {typeof queue.concurrency?.base === "number"
-                ? "limit set in code"
-                : "environment concurrency limit"}
-              .
-            </Paragraph>
-          ) : (
-            <Paragraph>
-              Override this queue's concurrency limit. The current limit is {currentLimit}, which is
-              set {queue.concurrencyLimit !== null ? "in code" : "by the environment"}.
-            </Paragraph>
-          )}
-          <Form method="post" onSubmit={() => setIsOpen(false)} className="space-y-3">
-            <input type="hidden" name="friendlyId" value={queue.id} />
-            <div className="space-y-2">
-              <label htmlFor="concurrencyLimit" className="text-sm text-text-bright">
-                Concurrency limit
-              </label>
+        <Form method="post" onSubmit={() => setIsOpen(false)}>
+          <input type="hidden" name="friendlyId" value={queue.id} />
+          <input type="hidden" name="rateLimits" value={JSON.stringify(rateLimits.filter(rl => rl.limit > 0 && rl.window > 0))} />
+          
+          <Fieldset className="max-h-[70vh] overflow-y-auto p-4 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600 space-y-4">
+            {isOverridden ? (
+              <Paragraph>
+                This queue's limits are currently overridden.
+                {typeof queue.concurrency?.base === "number" &&
+                  ` The original concurrency limit set in code was ${queue.concurrency.base}.`}{" "}
+                You can update the override or remove it to restore the{" "}
+                {typeof queue.concurrency?.base === "number"
+                  ? "limit set in code"
+                  : "environment concurrency limit"}
+                .
+              </Paragraph>
+            ) : (
+              <Paragraph>
+                Override this queue's limits. The current concurrency limit is {currentLimit}, which is
+                set {queue.concurrencyLimit !== null ? "in code" : "by the environment"}.
+              </Paragraph>
+            )}
+
+            <InputGroup fullWidth>
+              <Label htmlFor="concurrencyLimit">Concurrency limit</Label>
               <Input
                 type="number"
                 name="concurrencyLimit"
@@ -954,50 +1014,114 @@ function QueueOverrideConcurrencyButton({
                 placeholder={currentLimit.toString()}
                 autoFocus
               />
-            </div>
+            </InputGroup>
 
-            <FormButtons
-              defaultAction={{
-                name: "action",
-                value: "queue-override",
-                disabled: isLoading || !concurrencyLimit,
-              }}
-              confirmButton={
-                <Button
-                  type="submit"
-                  name="action"
-                  value="queue-override"
-                  disabled={isLoading || !concurrencyLimit}
-                  variant="primary/medium"
-                  LeadingIcon={isLoading && <Spinner color="white" />}
-                  shortcut={{ modifiers: ["mod"], key: "enter" }}
-                >
-                  {isOverridden ? "Update override" : "Override limit"}
-                </Button>
-              }
-              cancelButton={
-                <div className="flex items-center justify-between gap-2">
-                  {isOverridden && (
-                    <Button
-                      type="submit"
-                      name="action"
-                      value="queue-remove-override"
-                      disabled={isLoading}
-                      variant="danger/medium"
-                    >
-                      Remove override
-                    </Button>
-                  )}
-                  <DialogClose asChild>
-                    <Button type="button" variant="tertiary/medium">
-                      Cancel
-                    </Button>
-                  </DialogClose>
+            <InputGroup fullWidth>
+              <div className="grid w-full grid-cols-[1fr_1fr] gap-1.5">
+                <Label>Rate limit</Label>
+                <Label>Window (seconds)</Label>
+              </div>
+              {rateLimits.map((rl, index) => (
+                <div key={index} className="grid w-full grid-cols-[1fr_1fr] gap-1.5">
+                  <Input
+                    type="number"
+                    min="1"
+                    value={rl.limit || ""}
+                    onChange={(e) => {
+                      const newLimits = [...rateLimits];
+                      newLimits[index].limit = parseInt(e.target.value, 10) || 0;
+                      setRateLimits(newLimits);
+                    }}
+                    placeholder="e.g. 10"
+                  />
+                  <div className="flex items-start gap-1">
+                    <div className="grow">
+                      <Input
+                        type="number"
+                        min="1"
+                        value={rl.window || ""}
+                        onChange={(e) => {
+                          const newLimits = [...rateLimits];
+                          newLimits[index].window = parseInt(e.target.value, 10) || 0;
+                          setRateLimits(newLimits);
+                        }}
+                        placeholder="e.g. 60"
+                      />
+                    </div>
+                    {rateLimits.length > 1 && (
+                      <Button
+                        type="button"
+                        variant="minimal/medium"
+                        onClick={() => {
+                          const newLimits = [...rateLimits];
+                          newLimits.splice(index, 1);
+                          setRateLimits(newLimits);
+                        }}
+                        LeadingIcon={XMarkIcon}
+                      />
+                    )}
+                  </div>
                 </div>
-              }
-            />
-          </Form>
-        </div>
+              ))}
+              <div className="flex items-center justify-between gap-4">
+                <Paragraph variant="extra-small">
+                  Tip: You can also set dynamic rate limits in your code.
+                </Paragraph>
+                <Button
+                  type="button"
+                  variant="tertiary/medium"
+                  className="w-fit"
+                  onClick={() => setRateLimits([...rateLimits, { limit: 0, window: 0 }])}
+                  LeadingIcon={PlusIcon}
+                >
+                  Add another
+                </Button>
+              </div>
+            </InputGroup>
+          </Fieldset>
+
+          <FormButtons
+            className="px-4 pb-4"
+            defaultAction={{
+              name: "action",
+              value: "queue-override",
+              disabled: isLoading || !concurrencyLimit,
+            }}
+            confirmButton={
+              <Button
+                type="submit"
+                name="action"
+                value="queue-override"
+                disabled={isLoading || !concurrencyLimit}
+                variant="primary/medium"
+                LeadingIcon={isLoading && <Spinner color="white" />}
+                shortcut={{ modifiers: ["mod"], key: "enter" }}
+              >
+                {isOverridden ? "Update override" : "Override limit"}
+              </Button>
+            }
+            cancelButton={
+              <div className="flex items-center justify-between gap-2">
+                {isOverridden && (
+                  <Button
+                    type="submit"
+                    name="action"
+                    value="queue-remove-override"
+                    disabled={isLoading}
+                    variant="danger/medium"
+                  >
+                    Remove override
+                  </Button>
+                )}
+                <DialogClose asChild>
+                  <Button type="button" variant="tertiary/medium">
+                    Cancel
+                  </Button>
+                </DialogClose>
+              </div>
+            }
+          />
+        </Form>
       </DialogContent>
     </Dialog>
   );
